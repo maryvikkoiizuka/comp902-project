@@ -204,7 +204,126 @@ type UploadedPdf = RequirementsDocument & {
   }[];
 };
 
-function RequirementsEntry() {
+type DocumentSummary = {
+  document_id: string;
+  title: string;
+  created_at: string;
+  source_type: "pdf" | "manual";
+  filename: string | null;
+  page_count: number | null;
+  requirement_count: number;
+};
+
+type DocumentsResponse = {
+  total_count: number;
+  offset: number;
+  limit: number;
+  documents: DocumentSummary[];
+};
+
+function DocumentBrowser({ currentDocumentId, refreshKey, disabled, onOpen }: {
+  currentDocumentId: string;
+  refreshKey: number;
+  disabled: boolean;
+  onOpen: (documentId: string) => void;
+}) {
+  const [searchInput, setSearchInput] = useState("");
+  const [query, setQuery] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [refresh, setRefresh] = useState(0);
+  const [data, setData] = useState<DocumentsResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pageSize = 12;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
+    setData(null);
+    async function loadDocuments() {
+      try {
+        const parameters = new URLSearchParams({ query, offset: String(offset), limit: String(pageSize) });
+        const response = await fetch(`${API_BASE}/requirements/documents?${parameters}`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(`Could not load documents (HTTP ${response.status}). Check that main_v26 is running.`);
+        const result: DocumentsResponse = await response.json();
+        if (!Array.isArray(result.documents) || !Number.isInteger(result.total_count) || result.total_count < 0 ||
+          result.offset !== offset || result.limit !== pageSize || !result.documents.every((item) =>
+            item && typeof item.document_id === "string" && typeof item.title === "string" && typeof item.created_at === "string" &&
+            Number.isInteger(item.requirement_count) && item.requirement_count >= 0)) {
+          throw new Error("The backend returned incomplete document list details.");
+        }
+        if (!controller.signal.aborted) {
+          if (offset > 0 && result.documents.length === 0 && result.total_count > 0) {
+            setOffset(Math.floor((result.total_count - 1) / pageSize) * pageSize);
+          } else setData(result);
+        }
+      } catch (caught) {
+        if (!controller.signal.aborted) setError(caught instanceof TypeError
+          ? "Could not reach the backend. Start FastAPI, then refresh the document list."
+          : caught instanceof Error ? caught.message : "Unable to load documents.");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }
+    void loadDocuments();
+    return () => controller.abort();
+  }, [query, offset, refresh, refreshKey]);
+
+  return (
+    <section aria-labelledby="documents-heading" style={{ marginBottom: "24px", padding: "24px", background: "#ffffff", border: "1px solid #e0e6ed", borderRadius: "14px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "14px", flexWrap: "wrap" }}>
+        <div>
+          <h2 id="documents-heading" style={{ fontSize: "24px", fontWeight: 700 }}>Your documents</h2>
+          <p style={{ marginTop: "8px", fontSize: "14px", color: "#596779" }}>Find a document by title or filename, then open its requirements and tests.</p>
+        </div>
+        <button type="button" disabled={loading} onClick={() => setRefresh((value) => value + 1)} style={{ ...buttonStyle, background: "#ffffff", color: "#24634f" }}>Refresh documents</button>
+      </div>
+      <form onSubmit={(event) => { event.preventDefault(); setQuery(searchInput.trim()); setOffset(0); setRefresh((value) => value + 1); }}
+        style={{ display: "flex", gap: "10px", marginTop: "20px", flexWrap: "wrap" }}>
+        <label style={{ flex: "1 1 260px", fontSize: "13px", fontWeight: 600 }}>
+          Search documents
+          <input type="search" value={searchInput} onChange={(event) => setSearchInput(event.target.value)} placeholder="e.g. Login requirements or sample_requirements"
+            maxLength={200} style={{ display: "block", marginTop: "7px", boxSizing: "border-box", width: "100%", padding: "11px 12px", border: "1px solid #bac5d2", borderRadius: "8px", color: "#1c293b", background: "#ffffff", fontFamily: "inherit" }} />
+        </label>
+        <button type="submit" style={{ ...buttonStyle, alignSelf: "flex-end" }}>Search</button>
+        {query && <button type="button" onClick={() => { setSearchInput(""); setQuery(""); setOffset(0); }} style={{ ...buttonStyle, alignSelf: "flex-end", background: "#ffffff", color: "#24634f" }}>Clear search</button>}
+      </form>
+      {loading && <p role="status" style={{ marginTop: "20px" }}>Loading documents...</p>}
+      {error && <p role="alert" style={{ marginTop: "20px", padding: "14px", background: "#fde9e9", color: "#9d2929", borderRadius: "8px" }}>{error}</p>}
+      {data && <>
+        <p role="status" style={{ marginTop: "16px", fontSize: "13px", color: "#596779" }}>
+          {data.total_count} {query ? "matching" : "saved"} {data.total_count === 1 ? "document" : "documents"}. Newest first.
+        </p>
+        {data.documents.length === 0 ? <p style={{ marginTop: "16px", padding: "20px", background: "#f3f6fa", borderRadius: "8px" }}>{query ? "No documents match this search. Try another title or filename." : "No documents saved yet. Use Add a document below to get started."}</p> :
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "14px", marginTop: "16px" }}>
+            {data.documents.map((item) => {
+              const selected = item.document_id === currentDocumentId;
+              const date = new Date(item.created_at);
+              return <article key={item.document_id} style={{ padding: "18px", border: `1px solid ${selected ? "#24634f" : "#e0e6ed"}`, borderRadius: "10px", background: selected ? "#f0f7f4" : "#ffffff", minWidth: 0 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "12px", color: "#596779", marginBottom: "10px" }}>
+                  <span>{item.source_type === "pdf" ? "PDF document" : "Manual text"}</span>
+                  {selected && <strong style={{ color: "#24634f" }}>Selected</strong>}
+                </div>
+                <h3 style={{ fontSize: "16px", fontWeight: 700, overflowWrap: "anywhere", lineHeight: 1.5 }}>{item.title}</h3>
+                {item.filename && <p style={{ marginTop: "8px", color: "#596779", fontSize: "12px", overflowWrap: "anywhere" }}>{item.filename}{item.page_count != null ? ` · ${item.page_count} pages` : ""}</p>}
+                <p style={{ marginTop: "12px", fontSize: "12px", color: "#596779" }}>Added {Number.isNaN(date.getTime()) ? item.created_at : date.toLocaleString()}</p>
+                <p style={{ marginTop: "8px", fontSize: "13px" }}>{item.requirement_count} saved requirements</p>
+                <button type="button" disabled={disabled} onClick={() => onOpen(item.document_id)} style={{ ...buttonStyle, marginTop: "16px", width: "100%", opacity: disabled ? 0.6 : 1 }}>{selected ? "Open / refresh document" : "Open document"}</button>
+              </article>;
+            })}
+          </div>}
+        {data.total_count > pageSize && <div style={{ display: "flex", alignItems: "center", gap: "12px", marginTop: "18px", flexWrap: "wrap" }}>
+          <button type="button" disabled={offset === 0} onClick={() => setOffset((value) => Math.max(0, value - pageSize))} style={{ ...buttonStyle, background: "#ffffff", color: "#24634f" }}>Previous</button>
+          <span style={{ fontSize: "13px" }}>Page {Math.floor(offset / pageSize) + 1} of {Math.ceil(data.total_count / pageSize)}</span>
+          <button type="button" disabled={offset + pageSize >= data.total_count} onClick={() => setOffset((value) => value + pageSize)} style={buttonStyle}>Next</button>
+        </div>}
+      </>}
+    </section>
+  );
+}
+
+function RequirementsEntry({ onSaved }: { onSaved: (documentId: string) => void }) {
   const [method, setMethod] = useState<"pdf" | "manual" | null>(null);
   const options = [
     { value: "pdf" as const, title: "Upload PDF", description: "Use an existing requirements document. Keep its filename and page references.", panelId: "pdf-entry-panel" },
@@ -239,7 +358,7 @@ function RequirementsEntry() {
         </p>
       </div>
       {/* Keep both forms mounted so changing methods preserves input and saved results. */}
-      <div id="pdf-entry-panel" hidden={method !== "pdf"}><PdfUploadForm /></div>
+      <div id="pdf-entry-panel" hidden={method !== "pdf"}><PdfUploadForm onSaved={onSaved} /></div>
       <div id="manual-entry-panel" hidden={method !== "manual"}><RequirementsInputForm /></div>
     </section>
   );
@@ -266,29 +385,42 @@ type RequirementsPreviewResponse = {
   warnings?: string[];
 };
 
-function RequirementsPreview({ documentId }: { documentId: string }) {
+function RequirementsPreview({ documentId, onSaved }: { documentId: string; onSaved: (documentId: string) => void }) {
   const [preview, setPreview] = useState<RequirementsPreviewResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [excludedIds, setExcludedIds] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [savedCount, setSavedCount] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const saveControllerRef = useRef<AbortController | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setPreview(null);
+    setExcludedIds([]);
+    setSavedCount(null);
+    setSaveError(null);
+    setSaving(false);
     setError(null);
     setLoading(false);
     return () => {
+      saveControllerRef.current?.abort();
+      saveControllerRef.current = null;
       controllerRef.current?.abort();
       controllerRef.current = null;
     };
   }, [documentId]);
 
   async function loadPreview() {
-    if (controllerRef.current) return;
+    if (controllerRef.current || saveControllerRef.current || savedCount !== null) return;
     const controller = new AbortController();
     controllerRef.current = controller;
     setLoading(true);
     setError(null);
     setPreview(null);
+    setExcludedIds([]);
+    setSaveError(null);
     try {
       const response = await fetch(
         `${API_BASE}/requirements/documents/${encodeURIComponent(documentId)}/requirements/preview`,
@@ -326,6 +458,45 @@ function RequirementsPreview({ documentId }: { documentId: string }) {
     }
   }
 
+  async function saveSelected() {
+    if (!preview || loading || saveControllerRef.current || savedCount !== null) return;
+    const requirementIds = preview.requirements.filter((item) => !excludedIds.includes(item.requirement_id)).map((item) => item.requirement_id);
+    if (requirementIds.length === 0) return;
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const response = await fetch(`${API_BASE}/requirements/documents/${encodeURIComponent(documentId)}/requirements`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requirement_ids: requirementIds }), signal: controller.signal,
+      });
+      if (!response.ok) {
+        let message = `Saving requirements failed (HTTP ${response.status}).`;
+        try { const body = await response.json(); if (typeof body.detail === "string") message = body.detail; } catch { /* Keep HTTP message. */ }
+        throw new Error(message);
+      }
+      const result = await response.json();
+      if (result.document_id !== documentId || result.saved !== true || result.selected_count !== requirementIds.length ||
+        !Array.isArray(result.requirements) || !requirementIds.every((id) => result.requirements.some((item: PreviewRequirement) => item.document_id === documentId && item.requirement_id === id))) {
+        throw new Error("The save response could not be confirmed. Check that main_v24 is running and refresh saved requirements before retrying.");
+      }
+      if (!controller.signal.aborted) {
+        setSavedCount(result.selected_count);
+        onSaved(documentId);
+      }
+    } catch (caught) {
+      if (!controller.signal.aborted) setSaveError(caught instanceof TypeError
+        ? "The save response was not received. Refresh saved requirements to check the result. Retrying the same selection will not duplicate requirements."
+        : caught instanceof Error ? caught.message : "Unable to save selected requirements.");
+    } finally {
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = null;
+        if (!controller.signal.aborted) setSaving(false);
+      }
+    }
+  }
+
   return (
     <section aria-label="Requirements preview" style={{ marginTop: "20px", padding: "18px", border: "1px solid #e0e6ed", borderRadius: "10px", background: "#ffffff" }}>
       <h3 style={{ fontSize: "18px", fontWeight: 700 }}>Preview requirements</h3>
@@ -333,9 +504,9 @@ function RequirementsPreview({ documentId }: { documentId: string }) {
         Check the candidate requirements before saving them. Currently, each non-empty document line
         becomes one candidate; headings or wrapped sentences may need review.
       </p>
-      <button type="button" onClick={() => void loadPreview()} disabled={loading}
-        style={{ ...buttonStyle, marginTop: "14px", opacity: loading ? 0.6 : 1 }}>
-        {loading ? "Loading preview..." : preview ? "Refresh preview" : "Preview requirements"}
+      <button type="button" onClick={() => void loadPreview()} disabled={loading || saving || savedCount !== null}
+        style={{ ...buttonStyle, marginTop: "14px", opacity: loading || saving || savedCount !== null ? 0.6 : 1 }}>
+        {savedCount !== null ? "Preview saved" : loading ? "Loading preview..." : preview ? "Refresh preview" : "Preview requirements"}
       </button>
       {loading && <p role="status" style={{ marginTop: "12px", fontSize: "13px" }}>Reading requirements from the saved document...</p>}
       {error && <p role="alert" style={{ marginTop: "14px", padding: "14px", background: "#fde9e9", color: "#9d2929", borderRadius: "8px" }}>{error}</p>}
@@ -344,7 +515,7 @@ function RequirementsPreview({ documentId }: { documentId: string }) {
           <p style={{ fontWeight: 600 }}>{preview.title}</p>
           <p style={{ marginTop: "8px", fontSize: "13px", overflowWrap: "anywhere" }}>Document ID: {preview.document_id}</p>
           <p role="status" style={{ marginTop: "12px", color: "#17623b", fontSize: "14px" }}>
-            {preview.requirement_count} candidate requirements found. Preview only — no requirements saved or indexed by this action.
+            {preview.requirement_count} candidate requirements found. {preview.requirements.length - excludedIds.length} selected. Excluding a candidate keeps the original document intact.
           </p>
           {(preview.warnings ?? []).map((warning, index) => (
             <p key={index} style={{ marginTop: "12px", padding: "12px", background: "#fff3d6", color: "#765300", borderRadius: "8px" }}>{warning}</p>
@@ -355,11 +526,11 @@ function RequirementsPreview({ documentId }: { documentId: string }) {
             <div style={{ marginTop: "16px", overflowX: "auto" }}>
               <table style={{ width: "100%", minWidth: "600px", borderCollapse: "collapse", fontSize: "14px" }}>
                 <thead style={{ background: "#edf2f7" }}>
-                  <tr>{["Candidate ID", "Requirement", "Source"].map((heading) => <th key={heading} scope="col" style={{ ...cellStyle, fontWeight: 600 }}>{heading}</th>)}</tr>
+                  <tr>{["Candidate ID", "Requirement", "Source", "Selection"].map((heading) => <th key={heading} scope="col" style={{ ...cellStyle, fontWeight: 600 }}>{heading}</th>)}</tr>
                 </thead>
                 <tbody>
                   {preview.requirements.map((item) => (
-                    <tr key={`${item.document_id}:${item.requirement_id}`}>
+                    <tr key={`${item.document_id}:${item.requirement_id}`} style={{ background: excludedIds.includes(item.requirement_id) ? "#f3f4f6" : undefined }}> 
                       <th scope="row" style={{ ...cellStyle, whiteSpace: "nowrap" }}>{item.requirement_id}</th>
                       <td style={{ ...cellStyle, lineHeight: 1.6, minWidth: "240px" }}>
                         {item.text}
@@ -374,14 +545,30 @@ function RequirementsPreview({ documentId }: { documentId: string }) {
                         {item.source_page_line != null && <div>Page line {item.source_page_line}</div>}
                         <div>Document line {item.source_line}</div>
                       </td>
+                      <td style={cellStyle}>
+                        <span style={{ display: "block", marginBottom: "8px", fontSize: "12px" }}>{excludedIds.includes(item.requirement_id) ? "Excluded" : "Selected"}</span>
+                        <button type="button" disabled={saving || savedCount !== null}
+                          onClick={() => setExcludedIds((ids) => ids.includes(item.requirement_id) ? ids.filter((id) => id !== item.requirement_id) : [...ids, item.requirement_id])}
+                          style={{ ...buttonStyle, background: "#ffffff", color: "#24634f", fontSize: "12px", padding: "7px 10px" }}>
+                          {excludedIds.includes(item.requirement_id) ? "Restore" : "Exclude"}
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           )}
+          <button type="button" onClick={() => void saveSelected()}
+            disabled={saving || savedCount !== null || preview.requirements.length === excludedIds.length}
+            style={{ ...buttonStyle, marginTop: "16px", opacity: saving || savedCount !== null || preview.requirements.length === excludedIds.length ? 0.6 : 1 }}>
+            {saving ? "Saving..." : savedCount !== null ? "Requirements saved" : "Save selected requirements"}
+          </button>
+          {savedCount !== null && <p role="status" style={{ marginTop: "12px", color: "#17623b" }}>{savedCount} selected requirements saved. Indexing is the next step.</p>}
+          {saveError && <p role="alert" style={{ marginTop: "12px", color: "#9d2929" }}>{saveError}</p>}
           <p style={{ marginTop: "14px", fontSize: "13px", color: "#596779", lineHeight: 1.6 }}>
-            Saving these requirements and indexing them will be the next steps before test-case generation.
+            Original candidate IDs and source references are preserved, so excluded IDs may leave gaps.
+            This action adds selected requirements; it does not delete any previously saved requirements or index them.
           </p>
         </div>
       )}
@@ -389,7 +576,7 @@ function RequirementsPreview({ documentId }: { documentId: string }) {
   );
 }
 
-function PdfUploadForm() {
+function PdfUploadForm({ onSaved }: { onSaved: (documentId: string) => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploaded, setUploaded] = useState<UploadedPdf | null>(null);
@@ -477,7 +664,7 @@ function PdfUploadForm() {
           <p style={{ marginTop: "8px", fontSize: "13px" }}><strong>PDF search indexing:</strong> {uploaded.pdf_search_indexed ? "Completed" : uploaded.pdf_search_index_status === "unconfirmed" ? "Not confirmed" : "Not completed"}</p>
           <p style={{ marginTop: "12px", fontSize: "13px", lineHeight: 1.6 }}>Preview the requirements below using this document automatically. Uploading this PDF again creates another document. Your currently loaded requirements remain below.</p>
           {uploaded.warnings.map((warning, index) => <p key={index} role="status" style={{ marginTop: "12px", padding: "12px", background: "#fff3d6", color: "#765300", borderRadius: "8px", lineHeight: 1.6 }}>{warning}</p>)}
-          <RequirementsPreview key={uploaded.document_id} documentId={uploaded.document_id} />
+          <RequirementsPreview key={uploaded.document_id} documentId={uploaded.document_id} onSaved={onSaved} />
           <h3 style={{ marginTop: "18px", fontSize: "16px", fontWeight: 700 }}>Extracted page text</h3>
           {uploaded.page_details.map((page) => (
             <details key={page.page} style={{ marginTop: "12px", padding: "12px", border: "1px solid #e0e6ed", borderRadius: "8px", background: "#ffffff" }}>
@@ -771,6 +958,147 @@ function editableFields(test: TestCaseContent): EditableFields {
   };
 }
 
+function ManualTestCaseForm({ requirement, documentTitle, onSaved, onClose }: {
+  requirement: RequirementCoverage;
+  documentTitle: string;
+  onSaved: (record: SavedTestCase) => void;
+  onClose: () => void;
+}) {
+  const [fields, setFields] = useState<EditableFields>({ title: "", preconditions: "", test_data: "", steps: "", expected_result: "", assumptions: "" });
+  const [source, setSource] = useState<SavedTestCase["requirement_snapshot"] | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [sourceRefresh, setSourceRefresh] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState<SavedTestCase | null>(null);
+  const [uncertain, setUncertain] = useState(false);
+  const controllerRef = useRef<AbortController | null>(null);
+  useEffect(() => () => controllerRef.current?.abort(), []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSource(null);
+    setSourceError(null);
+    async function loadSource() {
+      try {
+        const response = await fetch(`${API_BASE}/requirements/documents/${encodeURIComponent(requirement.document_id)}/requirements`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(`Could not load source references (HTTP ${response.status}).`);
+        const body = await response.json();
+        const target = Array.isArray(body.requirements) ? body.requirements.find((item: SavedTestCase["requirement_snapshot"]) => item.requirement_id === requirement.requirement_id && item.document_id === requirement.document_id) : null;
+        if (body.document_id !== requirement.document_id || !target || typeof target.source_text !== "string") throw new Error("The saved requirement source could not be confirmed.");
+        if (!controller.signal.aborted) setSource(target);
+      } catch (caught) {
+        if (!controller.signal.aborted) setSourceError(caught instanceof Error ? caught.message : "Unable to load requirement source.");
+      }
+    }
+    void loadSource();
+    return () => controller.abort();
+  }, [requirement.document_id, requirement.requirement_id, sourceRefresh]);
+
+  const labels: { key: keyof EditableFields; label: string; rows: number }[] = [
+    { key: "title", label: "Title", rows: 1 },
+    { key: "preconditions", label: "Preconditions — one item per line", rows: 3 },
+    { key: "test_data", label: "Test data — one item per line", rows: 3 },
+    { key: "steps", label: "Steps — one step per line, in execution order", rows: 4 },
+    { key: "expected_result", label: "Expected result", rows: 3 },
+    { key: "assumptions", label: "Assumptions — one item per line (optional)", rows: 3 },
+  ];
+
+  async function saveManualTest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!source || controllerRef.current || saved || uncertain) return;
+    const lines = (value: string) => value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const body: TestCaseContent = {
+      title: fields.title.trim(), preconditions: lines(fields.preconditions), test_data: lines(fields.test_data),
+      steps: lines(fields.steps), expected_result: fields.expected_result.trim(), assumptions: lines(fields.assumptions),
+      document_id: requirement.document_id, requirement_id: requirement.requirement_id,
+    };
+    setError(null);
+    if (!body.title || body.title.length > 200 || !body.expected_result || !body.preconditions.length || !body.test_data.length || !body.steps.length) {
+      setError("Enter a title (up to 200 characters), expected result, and at least one item each for preconditions, test data, and steps.");
+      return;
+    }
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setSaving(true);
+    let confirmedHttpFailure = false;
+    try {
+      const response = await fetch(`${API_BASE}/requirements/documents/${encodeURIComponent(requirement.document_id)}/requirements/${encodeURIComponent(requirement.requirement_id)}/test-cases`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal,
+      });
+      if (!response.ok) {
+        // A server error can occur after a write; keep such outcomes uncertain.
+        confirmedHttpFailure = response.status >= 400 && response.status < 500;
+        let message = `Could not save test case (HTTP ${response.status}).`;
+        try { const data = await response.json(); if (typeof data.detail === "string") message = data.detail; } catch { /* Keep HTTP message. */ }
+        throw new Error(message);
+      }
+      const result: SavedTestCase = await response.json();
+      if (!result.test_case_id || result.saved !== true || result.status !== "draft" ||
+        result.document_id !== requirement.document_id || result.requirement_id !== requirement.requirement_id ||
+        result.test_case?.document_id !== requirement.document_id || result.test_case?.requirement_id !== requirement.requirement_id ||
+        result.requirement_snapshot?.document_id !== requirement.document_id || result.requirement_snapshot?.requirement_id !== requirement.requirement_id) {
+        throw new Error("The save response did not confirm the test case and its source link.");
+      }
+      if (!controller.signal.aborted) {
+        const record = { ...result, review: null };
+        setSaved(record);
+        onSaved(record);
+      }
+    } catch (caught) {
+      if (!controller.signal.aborted) {
+        setUncertain(!confirmedHttpFailure);
+        setError((caught instanceof Error ? caught.message : "Could not save test case.") +
+          (!confirmedHttpFailure ? " The test may already be saved. Use Load / refresh and View tests to check before submitting again." : ""));
+      }
+    } finally {
+      if (controllerRef.current === controller) {
+        controllerRef.current = null;
+        if (!controller.signal.aborted) setSaving(false);
+      }
+    }
+  }
+
+  return (
+    <section id="manual-test-panel" aria-labelledby="manual-test-heading" style={{ marginTop: "24px", padding: "22px", background: "#ffffff", border: "1px solid #e0e6ed", borderRadius: "12px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+        <h3 id="manual-test-heading" style={{ fontSize: "20px", fontWeight: 700 }}>Add test case manually — {requirement.requirement_id}</h3>
+        <button type="button" disabled={saving} onClick={onClose} style={{ ...buttonStyle, background: "#ffffff", color: "#24634f" }}>Close form</button>
+      </div>
+      <p style={{ marginTop: "12px", color: "#596779", fontSize: "13px", lineHeight: 1.6 }}>Write a test for this existing requirement. Its REQ ID is already assigned; a unique test case ID is created when you save. The result stays a draft until reviewed.</p>
+      <div style={{ marginTop: "16px", padding: "14px", borderRadius: "8px", background: "#f3f6fa", fontSize: "13px", lineHeight: 1.7 }}>
+        <strong>{documentTitle} — {requirement.requirement_id}</strong>
+        <p style={{ whiteSpace: "pre-wrap", marginTop: "8px" }}>{source?.source_text ?? requirement.text}</p>
+        {source ? <div style={{ marginTop: "8px", overflowWrap: "anywhere" }}>
+          {source.filename && <div>File: {source.filename}</div>}
+          {source.page != null && <div>Page {source.page}; page line {source.source_page_line ?? "unspecified"}</div>}
+          <div>Document line {source.source_line}</div>
+        </div> : !sourceError ? <p role="status">Loading source references...</p> : null}
+        {sourceError && <div><p role="alert" style={{ color: "#9d2929" }}>{sourceError}</p><button type="button" onClick={() => setSourceRefresh((count) => count + 1)} style={{ ...buttonStyle, marginTop: "8px" }}>Retry source lookup</button></div>}
+      </div>
+      <form onSubmit={(event) => void saveManualTest(event)}>
+        <fieldset disabled={saving || saved !== null || uncertain} style={{ border: 0, padding: 0, margin: 0 }}>
+          {labels.map(({ key, label, rows }) => (
+            <label key={key} style={{ display: "block", marginTop: "16px", fontSize: "14px", fontWeight: 600 }}>
+              {label}
+              <textarea value={fields[key]} onChange={(event) => setFields((current) => ({ ...current, [key]: event.target.value }))}
+                required={key !== "assumptions"} maxLength={key === "title" ? 200 : undefined} rows={rows}
+                style={{ display: "block", marginTop: "8px", width: "100%", boxSizing: "border-box", padding: "10px 12px", border: "1px solid #bac5d2", borderRadius: "8px", fontFamily: "inherit", fontWeight: 400, color: "#1c293b", background: "#ffffff" }} />
+            </label>
+          ))}
+          <p style={{ marginTop: "12px", fontSize: "13px", color: "#596779" }}>If no special test data is needed, state that in Test data. Document unspecified behaviour under Assumptions.</p>
+          <button type="submit" disabled={!source} style={{ ...buttonStyle, marginTop: "16px" }}>{saving ? "Saving..." : saved ? "Draft saved" : "Save manual draft"}</button>
+        </fieldset>
+      </form>
+      {error && <p role="alert" style={{ marginTop: "14px", padding: "14px", background: "#fde9e9", color: "#9d2929", borderRadius: "8px" }}>{error}</p>}
+      {saved && <div>
+        <p role="status" style={{ marginTop: "16px", color: "#17623b", overflowWrap: "anywhere" }}>Draft saved. Test case ID: {saved.test_case_id}. Use View tests to edit, approve, or reject it.</p>
+        <TestDetails record={saved} documentTitle={documentTitle} />
+      </div>}
+    </section>
+  );
+}
+
 function DraftEditor({ record, onUpdated, onReviewed }: { record: SavedTestCase; onUpdated: (record: SavedTestCase) => void; onReviewed?: (record: SavedTestCase) => void }) {
   const [reviewNote, setReviewNote] = useState("");
   const [reviewing, setReviewing] = useState<"approved" | "rejected" | null>(null);
@@ -1010,6 +1338,10 @@ const buttonStyle: CSSProperties = {
 };
 
 export default function Home() {
+  const [manualRequirementId, setManualRequirementId] = useState<string | null>(null);
+  const [manualMessage, setManualMessage] = useState<string | null>(null);
+  const manualRefreshController = useRef<AbortController | null>(null);
+  useEffect(() => () => manualRefreshController.current?.abort(), []);
   const [showTraceability, setShowTraceability] = useState(false);
   const [backendStatus, setBackendStatus] = useState("Checking...");
   const [documentInput, setDocumentInput] = useState(INITIAL_DOCUMENT_ID);
@@ -1024,6 +1356,7 @@ export default function Home() {
   const [testErrors, setTestErrors] = useState<string[]>([]);
   const [generatedDraft, setGeneratedDraft] = useState<GeneratedDraft | null>(null);
   const [generatingRequirementId, setGeneratingRequirementId] = useState<string | null>(null);
+  const [generationMessage, setGenerationMessage] = useState<string | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const generationController = useRef<AbortController | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
@@ -1180,6 +1513,7 @@ export default function Home() {
     setGeneratingRequirementId(requirement.requirement_id);
     setGeneratedDraft(null);
     setGenerationError(null);
+    setGenerationMessage(null);
 
     try {
       const response = await fetch(
@@ -1195,7 +1529,18 @@ export default function Home() {
         } catch { /* Retain HTTP information for non-JSON error responses. */ }
         throw new Error(message);
       }
-      const draft: GeneratedDraft = await response.json();
+      const result = await response.json();
+      if (result.status === "no_additional_scenario") {
+        if (result.document_id !== requirement.document_id || result.requirement_id !== requirement.requirement_id ||
+          result.saved !== false || typeof result.reason !== "string" || !result.reason.trim()) {
+          throw new Error("Unexpected no-suggestion response from the backend.");
+        }
+        if (!controller.signal.aborted) {
+          setGenerationMessage(`${result.reason}${typeof result.existing_test_case_id === "string" ? ` Existing test ID: ${result.existing_test_case_id}.` : ""} No new draft was saved. This does not establish complete scenario coverage.`);
+        }
+        return;
+      }
+      const draft: GeneratedDraft = result;
       if (
         draft.document_id !== requirement.document_id ||
         draft.requirement_id !== requirement.requirement_id ||
@@ -1341,10 +1686,59 @@ export default function Home() {
     void refreshCoverage();
   }
 
-  function handleLoad(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const nextId = documentInput.trim();
+  function handleManualSaved(record: SavedTestCase) {
+    setManualMessage(`Manual draft saved for ${record.requirement_id}. Refreshing its linked tests...`);
+    setSelectedRequirementId(record.requirement_id);
+    manualRefreshController.current?.abort();
+    const controller = new AbortController();
+    manualRefreshController.current = controller;
+    async function refreshAfterManualSave() {
+      try {
+        const response = await fetch(`${API_BASE}/requirements/documents/${encodeURIComponent(record.document_id)}/coverage`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data: CoverageResponse = await response.json();
+        if (data.document_id !== record.document_id || !Array.isArray(data.requirements) ||
+          !data.requirements.some((item) => item.requirement_id === record.requirement_id && item.test_case_ids.includes(record.test_case_id))) throw new Error("Unexpected coverage response.");
+        if (!controller.signal.aborted) {
+          setCoverage(data);
+          setManualMessage(`Manual draft saved for ${record.requirement_id}. Use View tests below to edit or review it. Approval is still required for design coverage.`);
+        }
+      } catch {
+        if (!controller.signal.aborted) setManualMessage("The manual draft is saved, but linked tests could not be refreshed. Use Load / refresh; do not submit the draft again.");
+      } finally {
+        if (manualRefreshController.current === controller) manualRefreshController.current = null;
+      }
+    }
+    void refreshAfterManualSave();
+  }
+
+  function handleRequirementsSaved(savedDocumentId: string) {
+    manualRefreshController.current?.abort();
+    manualRefreshController.current = null;
+    setManualRequirementId(null);
+    setManualMessage(null);
+    // Refresh the document after a confirmed save. Leave active test work intact.
+    if (generationController.current || saveController.current) return;
+    setDocumentInput(savedDocumentId);
+    setDocumentId(savedDocumentId);
+    setSelectedRequirementId(null);
+    setGeneratedDraft(null);
+    setSavedDraftId(null);
+    setSavedGeneratedDraft(null);
+    setGenerationError(null);
+    setGenerationMessage(null);
+    setSaveError(null);
+    setSaveWarnings([]);
+    setRefreshCount((count) => count + 1);
+  }
+
+  function openDocument(id: string) {
+    const nextId = id.trim();
     if (!nextId || generationController.current || saveController.current) return;
+    manualRefreshController.current?.abort();
+    manualRefreshController.current = null;
+    setManualRequirementId(null);
+    setManualMessage(null);
     reviewRefreshController.current?.abort();
     reviewRefreshController.current = null;
     setReviewMessage(null);
@@ -1355,9 +1749,17 @@ export default function Home() {
     setSaveWarnings([]);
     setGeneratedDraft(null);
     setGenerationError(null);
+    setGenerationMessage(null);
     setSelectedRequirementId(null);
+    setDocumentInput(nextId);
     setDocumentId(nextId);
     setRefreshCount((count) => count + 1);
+    document.getElementById("document-workspace")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function handleLoad(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    openDocument(documentInput);
   }
 
   return (
@@ -1386,7 +1788,16 @@ export default function Home() {
           </p>
         </header>
 
-        <RequirementsEntry />
+        <DocumentBrowser currentDocumentId={documentId} refreshKey={refreshCount}
+          disabled={loading || generatingRequirementId !== null || savingDraft || manualRequirementId !== null}
+          onOpen={openDocument} />
+        <details style={{ marginBottom: "20px", padding: "18px", border: "1px solid #e0e6ed", borderRadius: "12px", background: "#ffffff" }}>
+          <summary style={{ cursor: "pointer", fontSize: "18px", fontWeight: 700 }}>Add a document</summary>
+          <div style={{ marginTop: "18px" }}><RequirementsEntry onSaved={handleRequirementsSaved} /></div>
+          <p style={{ fontSize: "13px", color: "#596779", lineHeight: 1.6 }}>After saving a new source, use Refresh documents above to find it.</p>
+        </details>
+        <details style={{ marginBottom: "20px" }}>
+          <summary style={{ cursor: "pointer", fontSize: "13px", color: "#596779" }}>Open by document ID (advanced)</summary>
 
         <form
           onSubmit={handleLoad}
@@ -1414,6 +1825,8 @@ export default function Home() {
             </button>
           </div>
         </form>
+        </details>
+        <div id="document-workspace" style={{ scrollMarginTop: "20px" }} />
 
         {loading && <p role="status" style={{ marginTop: "24px" }}>Loading requirements and coverage...</p>}
         {error && (
@@ -1456,7 +1869,7 @@ export default function Home() {
                 <p style={{ padding: "20px", background: "#ffffff", borderRadius: "10px" }}>
                   This document has no saved extracted requirements yet. Preview its requirements below.
                 </p>
-                <RequirementsPreview key={coverage.document_id} documentId={coverage.document_id} />
+                <RequirementsPreview key={coverage.document_id} documentId={coverage.document_id} onSaved={handleRequirementsSaved} />
               </div>
             ) : (
               <div style={{ overflowX: "auto", border: "1px solid #e0e6ed", borderRadius: "10px", background: "#ffffff" }}>
@@ -1507,7 +1920,12 @@ export default function Home() {
                             onClick={() => void handleGenerate(requirement)}
                             style={{ ...buttonStyle, display: "block", marginTop: "8px", padding: "7px 10px", whiteSpace: "nowrap", fontSize: "12px", opacity: generatingRequirementId !== null || savingDraft ? 0.6 : 1 }}
                           >
-                            {generatingRequirementId === requirement.requirement_id ? "Generating..." : "Generate draft"}
+                            {generatingRequirementId === requirement.requirement_id ? "Generating..." : requirement.test_case_count > 0 ? "Suggest another draft" : "Generate draft"}
+                          </button>
+                          <button type="button" disabled={generatingRequirementId !== null || savingDraft || manualRequirementId !== null}
+                            onClick={() => { setManualRequirementId(requirement.requirement_id); setManualMessage(null); }}
+                            style={{ ...buttonStyle, display: "block", marginTop: "8px", background: "#ffffff", color: "#24634f", fontSize: "12px", padding: "7px 10px" }}>
+                            Add test case manually
                           </button>
                         </td>
                       </tr>
@@ -1516,6 +1934,12 @@ export default function Home() {
                 </table>
               </div>
             )}
+            {manualRequirementId && coverage.requirements.find((item) => item.requirement_id === manualRequirementId) && (
+              <ManualTestCaseForm key={`${coverage.document_id}:${manualRequirementId}`}
+                requirement={coverage.requirements.find((item) => item.requirement_id === manualRequirementId)!}
+                documentTitle={coverage.title} onSaved={handleManualSaved} onClose={() => setManualRequirementId(null)} />
+            )}
+            {manualMessage && <p role="status" style={{ marginTop: "16px", padding: "14px", background: "#edf7f2", borderRadius: "8px", color: "#17623b" }}>{manualMessage}</p>}
             <button type="button" aria-expanded={showTraceability} aria-controls="traceability-panel"
               onClick={() => setShowTraceability((value) => !value)}
               style={{ ...buttonStyle, marginTop: "22px", background: "#ffffff", color: "#24634f" }}>
@@ -1527,7 +1951,7 @@ export default function Home() {
                 document.getElementById("saved-tests-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
               }} />}
             </div>
-            {(generatingRequirementId !== null || generatedDraft || generationError) && (
+            {(generatingRequirementId !== null || generatedDraft || generationError || generationMessage) && (
               <section style={{ marginTop: "28px" }} aria-labelledby="generated-draft-heading">
                 <h3 id="generated-draft-heading" style={{ fontSize: "20px", fontWeight: 700 }}>
                   {generatingRequirementId ? `Generating draft for ${generatingRequirementId}` : generatedDraft ? `${savedDraftId ? "Saved test" : "Generated draft"} for ${generatedDraft.requirement_id}` : "Draft generation"}
@@ -1537,6 +1961,7 @@ export default function Home() {
                     Waiting for the local model. This may take a few minutes, especially on the first request.
                   </p>
                 )}
+                {generationMessage && <p role="status" style={{ marginTop: "16px", padding: "14px", background: "#edf2f7", color: "#1c293b", borderRadius: "8px", lineHeight: 1.6, overflowWrap: "anywhere" }}>{generationMessage}</p>}
                 {generationError && (
                   <p role="alert" style={{ marginTop: "16px", padding: "14px", background: "#fde9e9", color: "#9d2929", borderRadius: "8px" }}>
                     {generationError}
