@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import re
 import sqlite3
@@ -16,7 +17,7 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue,
+    Distance, VectorParams, PointStruct, Filter, FilterSelector, FieldCondition, MatchValue,
 )
 
 
@@ -167,7 +168,14 @@ def upload_pdf(file: UploadFile = File(...)):
         return result
 
     try:
-        qdrant.upsert(collection_name=COLLECTION_NAME, points=points, wait=True)
+        with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute("SELECT 1 FROM requirement_documents WHERE document_id = ?", (result["document_id"],)).fetchone() is None:
+                    raise HTTPException(status_code=410, detail="The uploaded document was deleted before indexing completed.")
+                qdrant.upsert(collection_name=COLLECTION_NAME, points=points, wait=True)
+    except HTTPException:
+        raise
     except Exception:
         # A failed response does not establish whether some points were written.
         result["stored_in_qdrant"] = None
@@ -525,6 +533,52 @@ def list_requirement_documents(
     }
 
 
+@app.delete("/requirements/documents/{document_id}")
+def delete_requirement_document(document_id: str):
+    # SQLite and Qdrant cannot share a transaction. Clear and verify vectors
+    # first; remove source records only after vector cleanup is confirmed.
+    selector = Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
+    vector_counts = {}
+    removed = {}
+    with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.row_factory = sqlite3.Row
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute("SELECT title FROM requirement_documents WHERE document_id = ?", (document_id,)).fetchone()
+            try:
+                for collection in (COLLECTION_NAME, REQUIREMENTS_COLLECTION):
+                    if not qdrant.collection_exists(collection):
+                        vector_counts[collection] = 0
+                        continue
+                    before = qdrant.count(collection_name=collection, count_filter=selector, exact=True).count
+                    qdrant.delete(collection_name=collection, points_selector=FilterSelector(filter=selector), wait=True)
+                    remaining = qdrant.count(collection_name=collection, count_filter=selector, exact=True).count
+                    if remaining != 0:
+                        raise RuntimeError("Vector cleanup is incomplete")
+                    vector_counts[collection] = before
+            except Exception:
+                raise HTTPException(status_code=503, detail="Vector cleanup could not be fully confirmed. The saved document and its records have been retained. Some vectors may already be removed; retry Delete document to finish cleanup.")
+
+            removed["reviews"] = connection.execute(
+                "DELETE FROM test_case_reviews WHERE test_case_id IN (SELECT test_case_id FROM test_cases WHERE document_id = ?)",
+                (document_id,),
+            ).rowcount
+            connection.execute("DELETE FROM requirement_index_state WHERE document_id = ?", (document_id,))
+            removed["test_case_links"] = connection.execute(
+                "DELETE FROM test_case_requirement_links WHERE document_id = ?", (document_id,)
+            ).rowcount
+            for key, table in (("test_cases", "test_cases"), ("requirements", "requirements"),
+                               ("pages", "requirement_document_pages"), ("original_pdfs", "requirement_pdf_sources"),
+                               ("documents", "requirement_documents")):
+                removed[key] = connection.execute(f"DELETE FROM {table} WHERE document_id = ?", (document_id,)).rowcount
+    return {
+        "document_id": document_id, "title": source["title"] if source else None,
+        "deleted": True, "already_deleted": source is None,
+        "removed_records": removed, "removed_vectors": vector_counts,
+    }
+
+
 @app.get("/requirements/documents/{document_id}")
 def get_requirement_document(document_id: str):
     with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
@@ -818,8 +872,87 @@ def get_saved_requirements(document_id: str):
 REQUIREMENTS_COLLECTION = "requirement_vectors"
 
 
+# A persistent receipt is tied to the saved content and checked against Qdrant.
+with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS requirement_index_state (
+            document_id TEXT PRIMARY KEY REFERENCES requirement_documents(document_id),
+            fingerprint TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            prepared_at TEXT NOT NULL
+        )
+    """)
+    connection.commit()
+
+
+def requirements_fingerprint(document):
+    content = {"model": "all-MiniLM-L6-v2", "collection": REQUIREMENTS_COLLECTION,
+               "title": document["title"], "requirements": document["requirements"]}
+    return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def requirement_points_current(document):
+    if not qdrant.collection_exists(REQUIREMENTS_COLLECTION):
+        return False
+    requirements = document["requirements"]
+    expected = {str(uuid5(NAMESPACE_URL, f"comp902/requirements/{document['document_id']}/{r['requirement_id']}")): r for r in requirements}
+    # Batch reads for large documents; never re-embed to verify an unchanged index.
+    point_ids = list(expected)
+    for start in range(0, len(point_ids), 256):
+        ids = point_ids[start:start + 256]
+        points = qdrant.retrieve(collection_name=REQUIREMENTS_COLLECTION, ids=ids, with_payload=True, with_vectors=False)
+        if len(points) != len(ids):
+            return False
+        for point in points:
+            source = expected.get(str(point.id))
+            payload = point.payload or {}
+            if source is None or payload.get("document_id") != document["document_id"] or payload.get("embedding_model") != "all-MiniLM-L6-v2":
+                return False
+            if any(payload.get(key) != source[key] for key in ("requirement_id", "text", "source_line", "source_text")):
+                return False
+    return True
+
+
+def prepare_requirement_index(document_id: str, force: bool = False):
+    # Serialize with requirement saves and document deletion across API workers.
+    try:
+        with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                document = get_saved_requirements(document_id)
+                if not document["requirements"]:
+                    raise HTTPException(status_code=409, detail="Preview and save requirements before generating test cases.")
+                fingerprint = requirements_fingerprint(document)
+                receipt = connection.execute("SELECT fingerprint, result_json FROM requirement_index_state WHERE document_id = ?", (document_id,)).fetchone()
+                if not force and receipt and receipt[0] == fingerprint and requirement_points_current(document):
+                    return {**json.loads(receipt[1]), "reused": True}
+                result = index_requirements_locked(document_id)
+                # Do not claim readiness when a vector write was not confirmed.
+                if not requirement_points_current(document):
+                    raise RuntimeError("Requirement vectors could not be verified")
+                connection.execute("""INSERT INTO requirement_index_state (document_id, fingerprint, result_json, prepared_at)
+                    VALUES (?, ?, ?, ?) ON CONFLICT(document_id) DO UPDATE SET
+                    fingerprint=excluded.fingerprint, result_json=excluded.result_json, prepared_at=excluded.prepared_at""",
+                    (document_id, fingerprint, json.dumps(result), datetime.now(timezone.utc).isoformat()))
+                return {**result, "reused": False}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="Requirements could not be prepared. Check the backend and vector database, then retry Generate AI draft. No test case was saved.")
+
+
 @app.post("/requirements/documents/{document_id}/index")
 def index_requirements(document_id: str):
+    # Preserve the existing explicit rebuild endpoint for API users.
+    return prepare_requirement_index(document_id, force=True)
+
+
+@app.post("/requirements/documents/{document_id}/prepare")
+def ensure_requirements_prepared(document_id: str):
+    return prepare_requirement_index(document_id)
+
+
+def index_requirements_locked(document_id: str):
     document = get_saved_requirements(document_id)
     requirements = document["requirements"]
 
@@ -1062,8 +1195,10 @@ def get_existing_requirement_tests(document_id, requirement_id):
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """SELECT t.test_case_id, t.status, t.test_case_json, r.note AS review_note
-               FROM test_cases t LEFT JOIN test_case_reviews r ON r.test_case_id = t.test_case_id
-               WHERE t.document_id = ? AND t.requirement_id = ?
+               FROM test_case_requirement_links l
+               JOIN test_cases t ON t.test_case_id = l.test_case_id
+               LEFT JOIN test_case_reviews r ON r.test_case_id = t.test_case_id
+               WHERE l.document_id = ? AND l.requirement_id = ?
                ORDER BY t.created_at, t.test_case_id""",
             (document_id, requirement_id),
         ).fetchall()
@@ -1103,6 +1238,10 @@ def no_new_draft_response(document_id, requirement_id, model_name, reason, exist
 
 @app.post("/requirements/documents/{document_id}/requirements/{requirement_id}/generate")
 def generate_test_case_draft(document_id: str, requirement_id: str):
+    document = get_saved_requirements(document_id)
+    if not any(r["requirement_id"] == requirement_id for r in document["requirements"]):
+        raise HTTPException(status_code=404, detail="Saved requirement not found.")
+    ensure_requirements_prepared(document_id)
     context_preview = preview_requirement_context(document_id, requirement_id)
     model_name = "llama3.2:3b"
     existing_tests = get_existing_requirement_tests(document_id, requirement_id)
@@ -1287,10 +1426,13 @@ Return only the final JSON draft; do not return this checklist or an explanation
 
 
 # -------------------------
-# Save a Submitted Test Case as an Unapproved Draft
+# Save a Submitted Test Case, with Optional Explicit Approval
 # -------------------------
 
 class TestCaseSubmission(TestCaseDraft):
+    authoring_method: Literal["submitted_draft", "manual"] = "submitted_draft"
+    approve_on_save: bool = False
+    review_note: str | None = Field(default=None, max_length=4000)
     document_id: str = Field(min_length=1)
     requirement_id: str = Field(min_length=1)
 
@@ -1310,7 +1452,60 @@ with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
                 REFERENCES requirements(document_id, requirement_id)
         )
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS test_case_id_sequence (
+            sequence_name TEXT PRIMARY KEY,
+            next_number INTEGER NOT NULL CHECK (next_number >= 1)
+        )
+    """)
+    # Start after the highest existing TC-### ID. Older UUID-based test IDs remain valid
+    # and do not affect the new human-readable sequence.
+    highest_existing = connection.execute(
+        """SELECT COALESCE(MAX(CAST(SUBSTR(test_case_id, 4) AS INTEGER)), 0)
+           FROM test_cases
+           WHERE test_case_id GLOB 'TC-[0-9]*'"""
+    ).fetchone()[0]
+    connection.execute(
+        """INSERT INTO test_case_id_sequence (sequence_name, next_number)
+           VALUES ('test_case', ?)
+           ON CONFLICT(sequence_name) DO UPDATE SET
+               next_number = MAX(test_case_id_sequence.next_number, excluded.next_number)""",
+        (highest_existing + 1,),
+    )
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS test_case_requirement_links (
+            test_case_id TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            requirement_id TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            PRIMARY KEY (test_case_id, document_id, requirement_id),
+            FOREIGN KEY (test_case_id) REFERENCES test_cases(test_case_id) ON DELETE CASCADE,
+            FOREIGN KEY (document_id, requirement_id) REFERENCES requirements(document_id, requirement_id) ON DELETE CASCADE
+        )
+    """)
+    # Backfill the original one-to-one relationship into the mapping table.
+    connection.execute(
+        """INSERT OR IGNORE INTO test_case_requirement_links
+           (test_case_id, document_id, requirement_id, linked_at)
+           SELECT test_case_id, document_id, requirement_id, created_at FROM test_cases"""
+    )
     connection.commit()
+
+
+def allocate_test_case_id(connection):
+    """Allocate the next global human-readable test ID inside the caller's transaction."""
+    row = connection.execute(
+        "SELECT next_number FROM test_case_id_sequence WHERE sequence_name = 'test_case'"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Test case ID sequence is not initialized.")
+
+    number = row[0]
+    connection.execute(
+        "UPDATE test_case_id_sequence SET next_number = ? WHERE sequence_name = 'test_case'",
+        (number + 1,),
+    )
+    return f"TC-{number:03d}"
 
 
 @app.post(
@@ -1329,6 +1524,13 @@ def save_test_case_draft(
             detail="The document_id and requirement_id in the body must match the URL fields.",
         )
 
+    if data.approve_on_save and data.authoring_method == "manual":
+        raise HTTPException(status_code=400, detail="Manual tests use the Ready flow.")
+    if data.approve_on_save and not (data.review_note or "").strip():
+        raise HTTPException(status_code=400, detail="A review comment is required to save and approve.")
+    if not data.approve_on_save and data.review_note is not None:
+        raise HTTPException(status_code=400, detail="A review comment requires approve_on_save.")
+
     document = get_saved_requirements(document_id)
     target = next(
         (r for r in document["requirements"] if r["requirement_id"] == requirement_id),
@@ -1337,9 +1539,12 @@ def save_test_case_draft(
     if target is None:
         raise HTTPException(status_code=404, detail="Saved requirement not found.")
 
-    test_case_id = str(uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
-    test_case = data.model_dump()
+    manual = data.authoring_method == "manual"
+    status = "ready" if manual else "approved" if data.approve_on_save else "draft"
+    origin = "manual_authored" if manual else "submitted_draft"
+    test_case = data.model_dump(exclude={"authoring_method", "approve_on_save", "review_note"})
+    review = {"decision": "approved", "note": data.review_note.strip(), "reviewed_at": created_at} if data.approve_on_save else None
 
     with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
@@ -1348,7 +1553,10 @@ def save_test_case_draft(
             # cannot both create a record.
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                "SELECT test_case_id, test_case_json FROM test_cases WHERE document_id = ? AND requirement_id = ?",
+                """SELECT t.test_case_id, t.test_case_json
+                   FROM test_case_requirement_links l
+                   JOIN test_cases t ON t.test_case_id = l.test_case_id
+                   WHERE l.document_id = ? AND l.requirement_id = ?""",
                 (document_id, requirement_id),
             ).fetchall()
             existing = [{"test_case_id": row[0], "test_case": json.loads(row[1])} for row in rows]
@@ -1358,6 +1566,11 @@ def save_test_case_draft(
                     status_code=409,
                     detail=f"A test with the same execution content already exists: {match['test_case_id']}. Use View tests to inspect it instead of saving another copy.",
                 )
+
+            # Allocate the readable ID only after duplicate validation. Because this
+            # happens inside BEGIN IMMEDIATE, concurrent saves cannot receive the
+            # same TC number, and a failed transaction does not consume a number.
+            test_case_id = allocate_test_case_id(connection)
             connection.execute(
                 """
                 INSERT INTO test_cases
@@ -1369,29 +1582,62 @@ def save_test_case_draft(
                     test_case_id,
                     document_id,
                     requirement_id,
-                    "draft",
+                    status,
                     json.dumps(test_case),
                     json.dumps(target),
-                    "submitted_draft",
+                    origin,
                     created_at,
                 ),
             )
+            connection.execute(
+                """INSERT INTO test_case_requirement_links
+                   (test_case_id, document_id, requirement_id, linked_at)
+                   VALUES (?, ?, ?, ?)""",
+                (test_case_id, document_id, requirement_id, created_at),
+            )
 
-    # This endpoint saves submitted content; it does not certify its AI origin,
-    # semantic correctness, execution results, or approval.
+            if review:
+                connection.execute(
+                    "INSERT INTO test_case_reviews (test_case_id, decision, note, reviewed_at) VALUES (?, ?, ?, ?)",
+                    (test_case_id, review["decision"], review["note"], review["reviewed_at"]),
+                )
+
+    # Approval records the caller's explicit review decision, not an executed test.
     return {
         "test_case_id": test_case_id,
         "document_id": document_id,
         "requirement_id": requirement_id,
-        "status": "draft",
+        "linked_requirement_ids": [requirement_id],
+        "status": status,
         "saved": True,
         "structured_validation": True,
         "validation_scope": "JSON structure, required fields, and non-empty values; not semantic correctness",
-        "origin": "submitted_draft",
+        "origin": origin,
         "created_at": created_at,
         "test_case": test_case,
         "requirement_snapshot": target,
+        "review": review,
+        "review_saved": review is not None,
     }
+
+
+# Delete a saved test and its review together. Requirements and source stay intact.
+@app.delete("/test-cases/{test_case_id}")
+def delete_test_case(test_case_id: str):
+    with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            record = connection.execute(
+                "SELECT document_id, requirement_id FROM test_cases WHERE test_case_id = ?",
+                (test_case_id,),
+            ).fetchone()
+            if record is None:
+                raise HTTPException(status_code=404, detail="Saved test case not found.")
+            connection.execute("DELETE FROM test_case_reviews WHERE test_case_id = ?", (test_case_id,))
+            connection.execute("DELETE FROM test_case_requirement_links WHERE test_case_id = ?", (test_case_id,))
+            connection.execute("DELETE FROM test_cases WHERE test_case_id = ?", (test_case_id,))
+    return {"test_case_id": test_case_id, "document_id": record[0], "requirement_id": record[1], "deleted": True}
 
 
 # -------------------------
@@ -1418,10 +1664,28 @@ def get_test_case(test_case_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Saved test case not found.")
 
+    with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
+        connection.row_factory = sqlite3.Row
+        linked_rows = connection.execute(
+            """SELECT l.document_id, l.requirement_id, d.title AS document_title
+               FROM test_case_requirement_links AS l
+               JOIN requirement_documents AS d ON d.document_id = l.document_id
+               WHERE l.test_case_id = ?
+               ORDER BY d.created_at, l.document_id, l.requirement_id""",
+            (test_case_id,),
+        ).fetchall()
+        linked_requirements = [dict(row) for row in linked_rows]
+        linked_requirement_ids = [
+            row["requirement_id"] for row in linked_rows
+            if row["document_id"] == record["document_id"]
+        ]
+
     return {
         "test_case_id": record["test_case_id"],
         "document_id": record["document_id"],
         "requirement_id": record["requirement_id"],
+        "linked_requirement_ids": linked_requirement_ids,
+        "linked_requirements": linked_requirements,
         "status": record["status"],
         "saved": True,
         "origin": record["origin"],
@@ -1440,11 +1704,15 @@ def get_test_case(test_case_id: str):
 
 
 # -------------------------
-# Replace the Content of an Unapproved Draft
+# Edit Saved Test Content and Explicitly Approve Reviewed Revisions
 # -------------------------
 
+class TestCaseEdit(TestCaseDraft):
+    review_note: str | None = Field(default=None, max_length=4000)
+
+
 @app.put("/test-cases/{test_case_id}")
-def edit_test_case_draft(test_case_id: str, data: TestCaseDraft):
+def edit_test_case_draft(test_case_id: str, data: TestCaseEdit):
     with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
         connection.row_factory = sqlite3.Row
         with connection:
@@ -1462,30 +1730,70 @@ def edit_test_case_draft(test_case_id: str, data: TestCaseDraft):
 
             if record is None:
                 raise HTTPException(status_code=404, detail="Saved test case not found.")
-            if record["status"] != "draft":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Only draft test cases can be edited.",
-                )
+            reviewed_ai = record["origin"] == "submitted_draft" and record["status"] in {"approved", "rejected"}
+            if record["status"] != "draft" and not reviewed_ai and not (record["status"] == "ready" and record["origin"] == "manual_authored"):
+                raise HTTPException(status_code=409, detail="This test case cannot be edited.")
+            if reviewed_ai and not (data.review_note or "").strip():
+                raise HTTPException(status_code=400, detail="A fresh review comment is required to save and approve revised AI test content.")
+            if not reviewed_ai and data.review_note is not None:
+                raise HTTPException(status_code=400, detail="Review comments on edit apply only to reviewed AI tests.")
+            updated_status = "approved" if reviewed_ai else record["status"]
+            review = None
 
             # IDs cannot be supplied in the editing body or reassigned here.
-            test_case = data.model_dump()
+            test_case = data.model_dump(exclude={"review_note"})
             test_case["document_id"] = record["document_id"]
             test_case["requirement_id"] = record["requirement_id"]
+            rows = connection.execute(
+                "SELECT test_case_id, test_case_json FROM test_cases WHERE document_id = ? AND requirement_id = ? AND test_case_id != ?",
+                (record["document_id"], record["requirement_id"], test_case_id),
+            ).fetchall()
+            match = matching_existing_test(
+                [{"test_case_id": row[0], "test_case": json.loads(row[1])} for row in rows], test_case,
+            )
+            if match:
+                raise HTTPException(status_code=409, detail=f"These changes duplicate existing test {match['test_case_id']}.")
             connection.execute(
                 """
                 UPDATE test_cases
-                SET test_case_json = ?
-                WHERE test_case_id = ? AND status = 'draft'
+                SET test_case_json = ?, status = ?
+                WHERE test_case_id = ? AND status = ?
                 """,
-                (json.dumps(test_case), test_case_id),
+                (json.dumps(test_case), updated_status, test_case_id, record["status"]),
             )
+
+            if reviewed_ai:
+                review = {"decision": "approved", "note": data.review_note.strip(), "reviewed_at": datetime.now(timezone.utc).isoformat()}
+                connection.execute(
+                    """INSERT INTO test_case_reviews (test_case_id, decision, note, reviewed_at)
+                       VALUES (?, ?, ?, ?) ON CONFLICT(test_case_id) DO UPDATE SET
+                       decision = excluded.decision, note = excluded.note, reviewed_at = excluded.reviewed_at""",
+                    (test_case_id, review["decision"], review["note"], review["reviewed_at"]),
+                )
+
+    with closing(sqlite3.connect(REQUIREMENTS_DB)) as link_connection:
+        link_connection.row_factory = sqlite3.Row
+        linked_rows = link_connection.execute(
+            """SELECT l.document_id, l.requirement_id, d.title AS document_title
+               FROM test_case_requirement_links AS l
+               JOIN requirement_documents AS d ON d.document_id = l.document_id
+               WHERE l.test_case_id = ?
+               ORDER BY d.created_at, l.document_id, l.requirement_id""",
+            (test_case_id,),
+        ).fetchall()
+        linked_requirements = [dict(row) for row in linked_rows]
+        linked_requirement_ids = [
+            row["requirement_id"] for row in linked_rows
+            if row["document_id"] == record["document_id"]
+        ]
 
     return {
         "test_case_id": record["test_case_id"],
         "document_id": record["document_id"],
         "requirement_id": record["requirement_id"],
-        "status": "draft",
+        "linked_requirement_ids": linked_requirement_ids,
+        "linked_requirements": linked_requirements,
+        "status": updated_status,
         "saved": True,
         "updated": True,
         "structured_validation": True,
@@ -1494,6 +1802,8 @@ def edit_test_case_draft(test_case_id: str, data: TestCaseDraft):
         "created_at": record["created_at"],
         "test_case": test_case,
         "requirement_snapshot": json.loads(record["requirement_snapshot_json"]),
+        "review": review,
+        "review_saved": review is not None,
     }
 
 
@@ -1518,6 +1828,54 @@ with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
         )
     """)
     connection.commit()
+
+
+def migrate_legacy_test_case_ids():
+    """Replace legacy UUID test IDs with stable global TC-### IDs.
+
+    Requirement linkage stays in document_id/requirement_id. Review rows are
+    migrated with the same ID so traceability and review history are preserved.
+    """
+    with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+        connection.row_factory = sqlite3.Row
+        # This migration updates a primary key referenced by test_case_reviews.
+        # Keep FK checking off only for this connection, update both tables in
+        # one write transaction, then verify there are no orphaned reviews.
+        connection.execute("PRAGMA foreign_keys = OFF")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            legacy_rows = connection.execute(
+                """SELECT test_case_id FROM test_cases
+                   WHERE test_case_id NOT GLOB 'TC-[0-9]*'
+                   ORDER BY created_at, test_case_id"""
+            ).fetchall()
+
+            for row in legacy_rows:
+                old_id = row["test_case_id"]
+                new_id = allocate_test_case_id(connection)
+                connection.execute(
+                    "UPDATE test_case_reviews SET test_case_id = ? WHERE test_case_id = ?",
+                    (new_id, old_id),
+                )
+                connection.execute(
+                    "UPDATE test_case_requirement_links SET test_case_id = ? WHERE test_case_id = ?",
+                    (new_id, old_id),
+                )
+                connection.execute(
+                    "UPDATE test_cases SET test_case_id = ? WHERE test_case_id = ?",
+                    (new_id, old_id),
+                )
+
+            orphan_count = connection.execute(
+                """SELECT COUNT(*) FROM test_case_reviews r
+                   LEFT JOIN test_cases t ON t.test_case_id = r.test_case_id
+                   WHERE t.test_case_id IS NULL"""
+            ).fetchone()[0]
+            if orphan_count:
+                raise RuntimeError("Legacy test-case ID migration left orphaned review rows.")
+
+
+migrate_legacy_test_case_ids()
 
 
 @app.post("/test-cases/{test_case_id}/review")
@@ -1559,6 +1917,75 @@ def review_test_case(test_case_id: str, data: TestCaseReview):
 
 
 # -------------------------
+# Link / Unlink Existing Test Cases to Requirements
+# -------------------------
+
+def get_requirement_link_target(document_id: str, requirement_id: str):
+    document = get_saved_requirements(document_id)
+    target = next((r for r in document["requirements"] if r["requirement_id"] == requirement_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Saved requirement not found.")
+    return target
+
+
+@app.post("/requirements/documents/{document_id}/requirements/{requirement_id}/test-cases/{test_case_id}/link")
+def link_existing_test_case(document_id: str, requirement_id: str, test_case_id: str):
+    get_requirement_link_target(document_id, requirement_id)
+    with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.row_factory = sqlite3.Row
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            test = connection.execute(
+                "SELECT test_case_id, document_id, requirement_id FROM test_cases WHERE test_case_id = ?",
+                (test_case_id,),
+            ).fetchone()
+            if test is None:
+                raise HTTPException(status_code=404, detail=f"Test case {test_case_id} was not found.")
+            already = connection.execute(
+                """SELECT 1 FROM test_case_requirement_links
+                   WHERE test_case_id = ? AND document_id = ? AND requirement_id = ?""",
+                (test_case_id, document_id, requirement_id),
+            ).fetchone() is not None
+            if not already:
+                connection.execute(
+                    """INSERT INTO test_case_requirement_links
+                       (test_case_id, document_id, requirement_id, linked_at) VALUES (?, ?, ?, ?)""",
+                    (test_case_id, document_id, requirement_id, datetime.now(timezone.utc).isoformat()),
+                )
+    result = get_test_case(test_case_id)
+    result.update({"linked": True, "already_linked": already, "linked_to_requirement_id": requirement_id})
+    return result
+
+
+@app.delete("/requirements/documents/{document_id}/requirements/{requirement_id}/test-cases/{test_case_id}/link")
+def unlink_existing_test_case(document_id: str, requirement_id: str, test_case_id: str):
+    get_requirement_link_target(document_id, requirement_id)
+    with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.row_factory = sqlite3.Row
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            test = connection.execute(
+                "SELECT test_case_id, document_id, requirement_id FROM test_cases WHERE test_case_id = ?",
+                (test_case_id,),
+            ).fetchone()
+            if test is None:
+                raise HTTPException(status_code=404, detail=f"Test case {test_case_id} was not found.")
+            if test["document_id"] == document_id and test["requirement_id"] == requirement_id:
+                raise HTTPException(status_code=409, detail="The original requirement link cannot be removed. Delete the test case instead if it is no longer valid.")
+            removed = connection.execute(
+                """DELETE FROM test_case_requirement_links
+                   WHERE test_case_id = ? AND document_id = ? AND requirement_id = ?""",
+                (test_case_id, document_id, requirement_id),
+            ).rowcount
+    return {
+        "test_case_id": test_case_id, "document_id": document_id, "requirement_id": requirement_id,
+        "unlinked": removed > 0, "already_unlinked": removed == 0,
+    }
+
+
+# -------------------------
 # Requirement-to-Test Traceability
 # -------------------------
 
@@ -1574,13 +2001,14 @@ def get_traceability(document_id: str):
             """
             SELECT r.requirement_id, r.text AS requirement_text,
                    r.source_line, r.source_text,
-                   t.test_case_id, t.status, t.test_case_json, t.created_at,
+                   t.test_case_id, t.status, t.origin, t.test_case_json, t.created_at,
                    v.decision AS review_decision, v.note AS review_note,
                    v.reviewed_at
             FROM requirements AS r
-            LEFT JOIN test_cases AS t
-                ON t.document_id = r.document_id
-                AND t.requirement_id = r.requirement_id
+            LEFT JOIN test_case_requirement_links AS l
+                ON l.document_id = r.document_id
+                AND l.requirement_id = r.requirement_id
+            LEFT JOIN test_cases AS t ON t.test_case_id = l.test_case_id
             LEFT JOIN test_case_reviews AS v ON v.test_case_id = t.test_case_id
             WHERE r.document_id = ?
             ORDER BY r.source_line, t.created_at, t.test_case_id
@@ -1609,6 +2037,7 @@ def get_traceability(document_id: str):
                 "test_case_id": row["test_case_id"],
                 "title": test_case["title"],
                 "status": row["status"],
+                "origin": row["origin"],
                 "created_at": row["created_at"],
                 "review": (
                     {
@@ -1649,11 +2078,12 @@ def get_requirement_coverage(document_id: str):
     for requirement in traceability["requirements"]:
         tests = requirement["test_cases"]
         approved_count = sum(t["status"] == "approved" for t in tests)
+        manual_ready_count = sum(t["status"] == "ready" and t["origin"] == "manual_authored" for t in tests)
         draft_count = sum(t["status"] == "draft" for t in tests)
         rejected_count = sum(t["status"] == "rejected" for t in tests)
 
         # Mutually exclusive statuses: approved takes priority, then draft.
-        if approved_count:
+        if approved_count or manual_ready_count:
             coverage_status = "covered"
         elif draft_count:
             coverage_status = "drafts_pending_review"
@@ -1669,9 +2099,10 @@ def get_requirement_coverage(document_id: str):
             "text": requirement["text"],
             "source_line": requirement["source_line"],
             "coverage_status": coverage_status,
-            "covered": approved_count > 0,
+            "covered": approved_count + manual_ready_count > 0,
             "test_case_count": len(tests),
             "approved_test_count": approved_count,
+            "manual_ready_test_count": manual_ready_count,
             "draft_test_count": draft_count,
             "rejected_test_count": rejected_count,
             "test_case_ids": [t["test_case_id"] for t in tests],
@@ -1682,8 +2113,8 @@ def get_requirement_coverage(document_id: str):
     return {
         "document_id": traceability["document_id"],
         "title": traceability["title"],
-        "coverage_basis": "At least one approved test case per saved requirement",
-        "coverage_scope": "Approved test-design coverage; not test execution results or complete scenario coverage",
+        "coverage_basis": "At least one approved test or ready manually authored test per saved requirement",
+        "coverage_scope": "Test-design coverage from approved tests or ready manual tests; not execution results or complete scenario coverage",
         "requirement_count": total,
         "covered_requirement_count": covered,
         "uncovered_requirement_count": total - covered,
