@@ -1613,6 +1613,59 @@ function RequirementSource({ requirement, documentId, refreshKey, actions }: {
   </>;
 }
 
+function AddRequirementToDocument({ documentId, onAdded }: { documentId: string; onAdded: (requirementId: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const requirementText = text.trim();
+    if (!requirementText) { setError("Enter the requirement text."); return; }
+    setSaving(true); setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/requirements/documents/${encodeURIComponent(documentId)}/requirements/manual`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: requirementText, note: note.trim() || null }),
+      });
+      if (!response.ok) {
+        let detail = `Unable to add requirement (HTTP ${response.status}).`;
+        try { const body = await response.json(); if (typeof body.detail === "string") detail = body.detail; } catch { /* fallback */ }
+        throw new Error(detail);
+      }
+      const result = await response.json();
+      const requirementId = result?.requirement?.requirement_id;
+      if (typeof requirementId !== "string") throw new Error("The backend did not return the new requirement ID.");
+      setText(""); setNote(""); setOpen(false);
+      onAdded(requirementId);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Unable to add requirement."); }
+    finally { setSaving(false); }
+  }
+
+  return <div style={{ marginTop: "12px" }}>
+    {!open ? <button type="button" className="modern-button secondary" onClick={() => { setOpen(true); setError(null); }}>+ Add requirement</button>
+      : <form onSubmit={submit} className="source-card" style={{ marginTop: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+            <div><h3 style={{ margin: 0 }}>Add requirement</h3><p className="muted" style={{ marginTop: "6px" }}>A new REQ-### ID will be assigned automatically to this document.</p></div>
+            <button type="button" className="modern-button secondary" disabled={saving} onClick={() => { setOpen(false); setText(""); setNote(""); setError(null); }}>Cancel</button>
+          </div>
+          <label style={{ display: "block", marginTop: "16px", fontSize: "13px", fontWeight: 600 }}>Requirement text
+            <textarea value={text} onChange={(event) => setText(event.target.value)} rows={4} maxLength={10000} placeholder="The system shall..."
+              style={{ display: "block", boxSizing: "border-box", width: "100%", marginTop: "7px", padding: "11px 12px", border: "1px solid #bac5d2", borderRadius: "8px", fontFamily: "inherit", resize: "vertical" }} />
+          </label>
+          <label style={{ display: "block", marginTop: "14px", fontSize: "13px", fontWeight: 600 }}>Source / note <span className="muted" style={{ fontWeight: 400 }}>(optional)</span>
+            <input value={note} onChange={(event) => setNote(event.target.value)} maxLength={1000} placeholder="Added manually during review"
+              style={{ display: "block", boxSizing: "border-box", width: "100%", marginTop: "7px", padding: "11px 12px", border: "1px solid #bac5d2", borderRadius: "8px", fontFamily: "inherit" }} />
+          </label>
+          {error && <p role="alert" style={{ marginTop: "12px", color: "#9d2929" }}>{error}</p>}
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "16px" }}><button type="submit" className="modern-button primary" disabled={saving}>{saving ? "Adding…" : "Add requirement"}</button></div>
+        </form>}
+  </div>;
+}
+
 function LinkExistingTest({ documentId, requirement, onChanged }: {
   documentId: string; requirement: RequirementCoverage; onChanged: () => void;
 }) {
@@ -1626,8 +1679,10 @@ function LinkExistingTest({ documentId, requirement, onChanged }: {
   useEffect(() => { setInput(""); setRecord(null); setError(null); setMessage(null); }, [requirement.requirement_id, documentId]);
 
   async function findTest() {
-    const testCaseId = input.trim().toUpperCase();
-    if (!/^TC-\d+$/.test(testCaseId)) { setError("Enter a test case ID such as TC-003."); setRecord(null); return; }
+    const raw = input.trim().toUpperCase().replace(/\s+/g, "");
+    const match = raw.match(/^(?:TC-?)?(\d+)$/);
+    if (!match) { setError("Enter a test case ID such as TC-003."); setRecord(null); return; }
+    const testCaseId = `TC-${String(Number(match[1])).padStart(3, "0")}`;
     setLoading(true); setError(null); setMessage(null); setRecord(null);
     try {
       const response = await fetch(`${API_BASE}/test-cases/${encodeURIComponent(testCaseId)}`, { cache: "no-store" });
@@ -1673,7 +1728,7 @@ function LinkExistingTest({ documentId, requirement, onChanged }: {
 
   return <section className="source-card" aria-label="Link an existing test case" style={{ marginTop: "16px" }}>
     <h3>Link existing test case</h3>
-    <p className="muted">Enter any saved test case ID. You can link tests across requirements documents without creating or copying the test.</p>
+    <p className="muted">Enter a saved test case ID (for example TC-003, TC-3, or 3). Tests can be linked across requirements documents without creating a duplicate.</p>
     <form onSubmit={(event) => { event.preventDefault(); void findTest(); }} style={{ display: "flex", gap: "10px", alignItems: "flex-end", flexWrap: "wrap", marginTop: "14px" }}>
       <label style={{ flex: "1 1 220px", fontSize: "13px", fontWeight: 600 }}>Test case ID
         <input value={input} onChange={(event) => { setInput(event.target.value.toUpperCase()); setRecord(null); setError(null); setMessage(null); }} placeholder="TC-003" maxLength={20}
@@ -2774,6 +2829,7 @@ export default function Home() {
               {coverage.requirements.length === 0 ? <RequirementsPreview key={coverage.document_id} documentId={coverage.document_id} onSaved={handleRequirementsSaved} /> : <div className="requirements-layout">
                 <section className="requirement-list" aria-label="Saved requirements">
                   <div className="list-heading"><h3>Requirements</h3><span>{coverage.requirement_count}</span></div>
+                  <AddRequirementToDocument documentId={coverage.document_id} onAdded={(requirementId) => { setFocusedRequirementId(requirementId); setSelectedRequirementId(requirementId); setRefreshCount((value) => value + 1); }} />
                   {coverage.requirements.map((item) => <button key={item.requirement_id} type="button" className={selectedRequirementId === item.requirement_id ? "requirement-item selected" : "requirement-item"} aria-pressed={selectedRequirementId === item.requirement_id} disabled={savingDraft || manualRequirementId !== null} onClick={() => setFocusedRequirementId(item.requirement_id)}>
                     <span className="test-list-meta"><strong>{item.requirement_id}</strong><span className="requirement-status" style={item.draft_test_count > 0 ? statusColors.drafts_pending_review : statusColors[item.coverage_status]}>{item.draft_test_count > 0 ? `${item.draft_test_count} drafts` : item.approved_test_count > 0 ? "Approved" : item.manual_ready_test_count > 0 ? "Ready" : item.rejected_test_count > 0 ? "Rejected" : "No tests"}</span></span>
                     <span style={{ display: "block", marginTop: "12px", lineHeight: 1.6 }}>{item.text}</span>

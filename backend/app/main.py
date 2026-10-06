@@ -837,6 +837,77 @@ def save_requirements(document_id: str, selection: RequirementSelection | None =
 
 
 # -------------------------
+# Add One Manual Requirement to an Existing Document
+# -------------------------
+
+class ManualRequirementCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=10000)
+    note: str | None = Field(default=None, max_length=1000)
+
+
+def next_requirement_id(connection, document_id: str):
+    rows = connection.execute(
+        "SELECT requirement_id FROM requirements WHERE document_id = ?",
+        (document_id,),
+    ).fetchall()
+    highest = 0
+    for row in rows:
+        match = re.fullmatch(r"REQ-(\d+)", row[0] or "", re.IGNORECASE)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return f"REQ-{highest + 1:03d}"
+
+
+@app.post("/requirements/documents/{document_id}/requirements/manual")
+def add_manual_requirement(document_id: str, data: ManualRequirementCreate):
+    # Confirm the parent document exists before allocating an ID.
+    document = get_requirement_document(document_id)
+    text = data.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Requirement text cannot be blank.")
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.row_factory = sqlite3.Row
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            requirement_id = next_requirement_id(connection, document_id)
+            source_line = connection.execute(
+                "SELECT COALESCE(MAX(source_line), 0) + 1 FROM requirements WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()[0]
+            source_text = text if not data.note else f"{text}\nManual note: {data.note.strip()}"
+            connection.execute(
+                """INSERT INTO requirements
+                   (document_id, requirement_id, text, source_line, source_text, created_at, filename, page, source_page_line)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)""",
+                (document_id, requirement_id, text, source_line, source_text, created_at),
+            )
+            # Any prior index receipt is now stale. Generation will automatically
+            # prepare/rebuild the requirement index before using the new requirement.
+            connection.execute("DELETE FROM requirement_index_state WHERE document_id = ?", (document_id,))
+            row = connection.execute(
+                """SELECT document_id, requirement_id, text, source_line, source_text, created_at, filename, page, source_page_line
+                   FROM requirements WHERE document_id = ? AND requirement_id = ?""",
+                (document_id, requirement_id),
+            ).fetchone()
+            requirement_count = connection.execute(
+                "SELECT COUNT(*) FROM requirements WHERE document_id = ?", (document_id,)
+            ).fetchone()[0]
+
+    return {
+        "document_id": document_id,
+        "title": document["title"],
+        "saved": True,
+        "manual": True,
+        "requirement_count": requirement_count,
+        "requirement": serialize_saved_requirement(row),
+    }
+
+
+# -------------------------
 # Read Saved Requirements
 # -------------------------
 
@@ -1644,8 +1715,17 @@ def delete_test_case(test_case_id: str):
 # Retrieve One Saved Test Case
 # -------------------------
 
+def normalize_test_case_id(value: str):
+    raw = (value or "").strip().upper().replace(" ", "")
+    match = re.fullmatch(r"(?:TC-?)?(\d+)", raw)
+    if not match:
+        return raw
+    return f"TC-{int(match.group(1)):03d}"
+
+
 @app.get("/test-cases/{test_case_id}")
 def get_test_case(test_case_id: str):
+    test_case_id = normalize_test_case_id(test_case_id)
     with closing(sqlite3.connect(REQUIREMENTS_DB)) as connection:
         connection.row_factory = sqlite3.Row
         record = connection.execute(
@@ -1930,6 +2010,7 @@ def get_requirement_link_target(document_id: str, requirement_id: str):
 
 @app.post("/requirements/documents/{document_id}/requirements/{requirement_id}/test-cases/{test_case_id}/link")
 def link_existing_test_case(document_id: str, requirement_id: str, test_case_id: str):
+    test_case_id = normalize_test_case_id(test_case_id)
     get_requirement_link_target(document_id, requirement_id)
     with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
@@ -1960,6 +2041,7 @@ def link_existing_test_case(document_id: str, requirement_id: str, test_case_id:
 
 @app.delete("/requirements/documents/{document_id}/requirements/{requirement_id}/test-cases/{test_case_id}/link")
 def unlink_existing_test_case(document_id: str, requirement_id: str, test_case_id: str):
+    test_case_id = normalize_test_case_id(test_case_id)
     get_requirement_link_target(document_id, requirement_id)
     with closing(sqlite3.connect(REQUIREMENTS_DB, timeout=30)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
